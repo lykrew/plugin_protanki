@@ -50,6 +50,7 @@ def load_settings() -> dict[str, Any]:
         "last_mode": "CP",
         "last_servers": {mode: "" for mode in MODES},
         "process_names": list(DEFAULT_PROCESS_NAMES),
+        "bell_enabled": True,
     }
     if not SETTINGS_PATH.exists():
         return settings
@@ -68,6 +69,7 @@ def load_settings() -> dict[str, Any]:
     names = raw.get("process_names", DEFAULT_PROCESS_NAMES)
     if isinstance(names, list) and names:
         settings["process_names"] = [str(name).strip() for name in names if str(name).strip()]
+    settings["bell_enabled"] = bool(raw.get("bell_enabled", True))
     return settings
 
 
@@ -80,6 +82,7 @@ def save_settings(settings: dict[str, Any]) -> None:
         "last_server": last_servers.get(last_mode, ""),
         "last_servers": {mode: last_servers.get(mode, "") for mode in MODES},
         "process_names": settings.get("process_names", list(DEFAULT_PROCESS_NAMES)),
+        "bell_enabled": bool(settings.get("bell_enabled", True)),
     }
     SETTINGS_PATH.write_text(
         json.dumps(payload, ensure_ascii=False, indent=2) + "\n",

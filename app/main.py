@@ -3,6 +3,7 @@ from __future__ import annotations
 import customtkinter as ctk
 
 from app.game_watch import is_game_running
+from app.notify import play_join_bell
 from app.paths import MODES
 from app.servers import (
     add_server,
@@ -34,6 +35,7 @@ class CompanionApp(ctk.CTk):
 
         self.status_var = ctk.StringVar(value="Игра: проверка…")
         self.selected_var = ctk.StringVar(value="")
+        self.bell_var = ctk.BooleanVar(value=bool(self.settings.get("bell_enabled", True)))
         self.name_var = ctk.StringVar()
         self.note_var = ctk.StringVar()
 
@@ -96,7 +98,16 @@ class CompanionApp(ctk.CTk):
             anchor="w", padx=12, pady=(16, 0)
         )
         ctk.CTkLabel(form, textvariable=self.selected_var, wraplength=200, justify="left").pack(
-            anchor="w", padx=12, pady=(0, 12)
+            anchor="w", padx=12, pady=(0, 8)
+        )
+        ctk.CTkCheckBox(
+            form,
+            text="Звонок при выборе сервера",
+            variable=self.bell_var,
+            command=self._toggle_bell,
+        ).pack(anchor="w", padx=12, pady=(8, 4))
+        ctk.CTkButton(form, text="Проверить звонок", command=self._test_bell).pack(
+            fill="x", padx=12, pady=(0, 12)
         )
 
     def _paint_mode_buttons(self) -> None:
@@ -143,7 +154,7 @@ class CompanionApp(ctk.CTk):
                 text=label,
                 anchor="w",
                 fg_color=("#1F6AA5", "#144870") if is_selected else "transparent",
-                command=lambda name=item["name"]: self._select_server(name),
+                command=lambda name=item["name"]: self._select_server(name, ring=True),
             )
             button.pack(fill="x", padx=4, pady=4)
             self.server_rows.append(row)
@@ -152,12 +163,25 @@ class CompanionApp(ctk.CTk):
         last_servers = self.settings.setdefault("last_servers", {})
         return str(last_servers.get(self.current_mode, "") or "")
 
-    def _select_server(self, name: str) -> None:
+    def _select_server(self, name: str, ring: bool = False) -> None:
         self.settings["last_mode"] = self.current_mode
         self.settings.setdefault("last_servers", {})[self.current_mode] = name
         save_settings(self.settings)
         self.selected_var.set(f"{self.current_mode} · {name}")
         self._refresh_list()
+        if ring:
+            self._maybe_ring()
+
+    def _toggle_bell(self) -> None:
+        self.settings["bell_enabled"] = bool(self.bell_var.get())
+        save_settings(self.settings)
+
+    def _test_bell(self) -> None:
+        play_join_bell()
+
+    def _maybe_ring(self) -> None:
+        if self.bell_var.get():
+            play_join_bell()
 
     def _restore_selection(self) -> None:
         last = self._selected_name()
@@ -179,7 +203,7 @@ class CompanionApp(ctk.CTk):
         save_catalog(self.catalog)
         self.name_var.set("")
         self.note_var.set("")
-        self._select_server(name)
+        self._select_server(name, ring=True)
 
     def _delete_selected(self) -> None:
         name = self._selected_name()
