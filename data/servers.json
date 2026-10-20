@@ -1,12 +1,17 @@
 {
-  "DM": [
-    {
-      "name": "DM — пример",
-      "note": "Замени на свой сервер",
-      "battle_link": ""
-    }
-  ],
+  "DM": [],
   "TDM": [],
   "CTF": [],
-  "CP": []
+  "CP": [
+    {
+      "name": "1",
+      "note": "",
+      "battle_link": "#/battle/7902e593fef23e34"
+    },
+    {
+      "name": "2",
+      "note": "",
+      "battle_link": "#/battle/7e9f8b70c6aa9f0a"
+    }
+  ]
 }

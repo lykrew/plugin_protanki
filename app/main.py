@@ -3,7 +3,7 @@ from __future__ import annotations
 import customtkinter as ctk
 from tkinter import Canvas, messagebox
 
-from app.game_automation import BattleJoinWatcher, preload_ocr
+from app.game_automation import BattleJoinWatcher, battle_id_from_link, preload_ocr
 from app.game_watch import find_game_process
 from app.notify import play_join_success
 from app.paths import MODES
@@ -58,6 +58,7 @@ class CompanionApp(ctk.CTk):
         self.note_var = ctk.StringVar()
         self.battle_link_var = ctk.StringVar()
         self.auto_joiner: BattleJoinWatcher | None = None
+        self.multi_target_vars: dict[str, ctk.BooleanVar] = {}
         self._ocr_result: str | None = None
         self._build()
         self.auto_join_button.configure(state="disabled", text="Подготавливаю распознавание…")
@@ -192,6 +193,12 @@ class CompanionApp(ctk.CTk):
         )
         list_card.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
         self._add_glass_edge(list_card)
+        ctk.CTkButton(
+            list_card, text="Удалить все", command=self._delete_all_servers,
+            width=105, height=32, corner_radius=11, fg_color="transparent",
+            hover_color="#303136", border_width=1, border_color="#66686E",
+            text_color="#D0D1D4", font=ctk.CTkFont(size=11, weight="bold"),
+        ).place(relx=0.96, y=17, anchor="ne")
         ctk.CTkLabel(
             list_card, text="Сохранённые бои", text_color=TEXT,
             font=ctk.CTkFont(size=20, weight="bold"),
@@ -337,6 +344,7 @@ class CompanionApp(ctk.CTk):
         for row in self.server_rows:
             row.destroy()
         self.server_rows.clear()
+        self.multi_target_vars.clear()
         items = self.catalog.get(self.current_mode, [])
         if not items:
             empty = ctk.CTkLabel(
@@ -345,9 +353,11 @@ class CompanionApp(ctk.CTk):
             )
             empty.pack(anchor="w", padx=10, pady=14)
             self.server_rows.append(empty)
+            self._update_auto_join_button_text()
             return
 
         selected = self._selected_name()
+        multi_targets = self.settings.setdefault("multi_targets", {}).setdefault(self.current_mode, [])
         for item in items:
             name = item["name"]
             link = item.get("battle_link", "")
@@ -361,8 +371,17 @@ class CompanionApp(ctk.CTk):
             )
             card.pack(fill="x", padx=4, pady=5)
             self.server_rows.append(card)
+            target_var = ctk.BooleanVar(value=name in multi_targets)
+            self.multi_target_vars[name] = target_var
+            ctk.CTkCheckBox(
+                card, text="", variable=target_var, width=22, height=22,
+                checkbox_width=20, checkbox_height=20,
+                fg_color="#D9DADD", hover_color="#FFFFFF",
+                border_color="#77797F", checkmark_color="#111215",
+                command=lambda target=name, var=target_var: self._set_multi_target(target, var.get()),
+            ).pack(side="left", padx=(13, 0), pady=8)
             text_box = ctk.CTkFrame(card, fg_color="transparent")
-            text_box.pack(fill="x", padx=15, pady=11)
+            text_box.pack(side="left", fill="x", expand=True, padx=13, pady=11)
             ctk.CTkLabel(
                 text_box, text=name, text_color=TEXT, anchor="w",
                 font=ctk.CTkFont(size=14, weight="bold"),
@@ -379,6 +398,33 @@ class CompanionApp(ctk.CTk):
                 ).pack(anchor="w", fill="x", pady=(3, 0))
             for widget in (card, text_box, *text_box.winfo_children()):
                 widget.bind("<Button-1>", lambda event, value=name: self._select_server(value))
+        self._update_auto_join_button_text()
+
+    def _set_multi_target(self, name: str, selected: bool) -> None:
+        targets = self.settings.setdefault("multi_targets", {}).setdefault(self.current_mode, [])
+        order = self.settings.setdefault("multi_target_order", [])
+        if selected and name not in targets:
+            targets.append(name)
+            order.append({"mode": self.current_mode, "name": name})
+        elif not selected and name in targets:
+            targets.remove(name)
+            self.settings["multi_target_order"] = [
+                entry for entry in order
+                if not (entry.get("mode") == self.current_mode and entry.get("name") == name)
+            ]
+        save_settings(self.settings)
+        self._update_auto_join_button_text()
+
+    def _update_auto_join_button_text(self) -> None:
+        if not hasattr(self, "auto_join_button"):
+            return
+        if self.auto_joiner and self.auto_joiner.running:
+            label = "Остановить мультизаход" if len(self.auto_joiner.battle_ids) > 1 else "Остановить автоподключение"
+        else:
+            targets = self.settings.setdefault("multi_targets", {})
+            count = sum(len(targets.setdefault(mode, [])) for mode in MODES)
+            label = f"Начать мультизаход ({count})" if count > 1 else "Начать автоподключение"
+        self.auto_join_button.configure(text=label)
 
     def _selected_name(self) -> str:
         return str(self.settings.setdefault("last_servers", {}).get(self.current_mode, "") or "")
@@ -437,6 +483,30 @@ class CompanionApp(ctk.CTk):
         remove_server(self.catalog, self.current_mode, name)
         save_catalog(self.catalog)
         self.settings.setdefault("last_servers", {})[self.current_mode] = ""
+        targets = self.settings.setdefault("multi_targets", {}).setdefault(self.current_mode, [])
+        if name in targets:
+            targets.remove(name)
+        self.settings["multi_target_order"] = [
+            entry for entry in self.settings.setdefault("multi_target_order", [])
+            if not (entry.get("mode") == self.current_mode and entry.get("name") == name)
+        ]
+        save_settings(self.settings)
+        self._refresh_list()
+        self._restore_selection()
+
+    def _delete_all_servers(self) -> None:
+        if not any(self.catalog.get(mode, []) for mode in MODES):
+            return
+        if not messagebox.askyesno(
+            "Удалить все бои",
+            "Удалить все сохранённые бои во всех режимах? Это действие нельзя отменить.",
+        ):
+            return
+        self.catalog = {mode: [] for mode in MODES}
+        self.settings["last_servers"] = {mode: "" for mode in MODES}
+        self.settings["multi_targets"] = {mode: [] for mode in MODES}
+        self.settings["multi_target_order"] = []
+        save_catalog(self.catalog)
         save_settings(self.settings)
         self._refresh_list()
         self._restore_selection()
@@ -444,15 +514,58 @@ class CompanionApp(ctk.CTk):
     def _toggle_auto_join(self) -> None:
         if self.auto_joiner and self.auto_joiner.running:
             self.auto_joiner.stop()
-            self.auto_join_button.configure(text="Начать автоподключение")
+            self._update_auto_join_button_text()
             self.auto_join_status_var.set("Автоподключение остановлено")
             return
-        link = self.battle_link_var.get().strip()
-        if not link:
+        all_targets = self.settings.setdefault("multi_targets", {})
+        selected_targets = [
+            (entry["mode"], entry["name"])
+            for entry in self.settings.setdefault("multi_target_order", [])
+            if isinstance(entry, dict)
+            and entry.get("mode") in MODES
+            and entry.get("name") in all_targets.setdefault(entry["mode"], [])
+        ]
+        ordered_keys = set(selected_targets)
+        selected_targets.extend(
+            (mode, name)
+            for mode in MODES
+            for name in all_targets.setdefault(mode, [])
+            if (mode, name) not in ordered_keys
+        )
+        if selected_targets:
+            selected_items = [
+                (mode, item)
+                for mode, name in selected_targets
+                for item in self.catalog.get(mode, [])
+                if item["name"] == name
+            ]
+            invalid_names = [
+                item["name"] for _mode, item in selected_items
+                if not battle_id_from_link(item.get("battle_link", ""))
+            ]
+            if invalid_names or len(selected_items) != len(selected_targets):
+                messagebox.showerror(
+                    "ProTanki",
+                    "Проверьте ссылки выбранных боёв: " + ", ".join(
+                        invalid_names or [name for _mode, name in selected_targets]
+                    ),
+                )
+                return
+            links = [item["battle_link"] for _mode, item in selected_items]
+            ids = [battle_id_from_link(link) for link in links]
+            if len(set(ids)) != len(ids):
+                messagebox.showerror(
+                    "ProTanki",
+                    "В выбранных сохранённых боях есть одинаковые ссылки. Уберите повтор, чтобы каждый выбранный бой проверялся отдельно.",
+                )
+                return
+        else:
+            links = [self.battle_link_var.get().strip()]
+        if not any(battle_id_from_link(link) for link in links):
             messagebox.showerror("ProTanki", "Выберите бой или вставьте ссылку на него.")
             return
         self.auto_joiner = BattleJoinWatcher(
-            link,
+            links,
             list(self.settings.get("process_names") or []),
             on_status=lambda text: self.after(0, self.auto_join_status_var.set, text),
             on_finished=self._auto_join_finished,
@@ -462,7 +575,7 @@ class CompanionApp(ctk.CTk):
         except ValueError as exc:
             messagebox.showerror("ProTanki", str(exc))
             return
-        self.auto_join_button.configure(text="Остановить автоподключение")
+        self._update_auto_join_button_text()
 
     def _store_ocr_result(self, error: str) -> None:
         # The loader runs on a worker thread; Tk widgets are updated only by
@@ -478,8 +591,8 @@ class CompanionApp(ctk.CTk):
     def _ocr_ready(self, error: str) -> None:
         self.auto_join_button.configure(
             state="normal",
-            text="Начать автоподключение",
         )
+        self._update_auto_join_button_text()
         if error:
             self.auto_join_status_var.set("Не удалось подготовить распознавание; запуск покажет причину")
         else:
@@ -489,7 +602,8 @@ class CompanionApp(ctk.CTk):
         try:
             def apply_result() -> None:
                 self.auto_join_status_var.set(text)
-                self.auto_join_button.configure(text="Начать автоподключение", state="normal")
+                self.auto_join_button.configure(state="normal")
+                self._update_auto_join_button_text()
                 if text == "Вход в бой выполнен.":
                     play_join_success()
 

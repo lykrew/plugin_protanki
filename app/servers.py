@@ -67,6 +67,8 @@ def load_settings() -> dict[str, Any]:
     settings: dict[str, Any] = {
         "last_mode": "CP",
         "last_servers": {mode: "" for mode in MODES},
+        "multi_targets": {mode: [] for mode in MODES},
+        "multi_target_order": [],
         "process_names": list(DEFAULT_PROCESS_NAMES),
     }
     if not SETTINGS_PATH.exists():
@@ -80,6 +82,31 @@ def load_settings() -> dict[str, Any]:
     if isinstance(last_servers, dict):
         for key in MODES:
             settings["last_servers"][key] = str(last_servers.get(key, "")).strip()
+    multi_targets = raw.get("multi_targets")
+    if isinstance(multi_targets, dict):
+        for key in MODES:
+            values = multi_targets.get(key, [])
+            if isinstance(values, list):
+                settings["multi_targets"][key] = list(dict.fromkeys(
+                    str(value).strip() for value in values if str(value).strip()
+                ))
+    order = raw.get("multi_target_order")
+    if isinstance(order, list):
+        seen: set[tuple[str, str]] = set()
+        for entry in order:
+            if not isinstance(entry, dict):
+                continue
+            target_mode = str(entry.get("mode", "")).strip().upper()
+            name = str(entry.get("name", "")).strip()
+            key = (target_mode, name)
+            if target_mode in MODES and name and name in settings["multi_targets"][target_mode] and key not in seen:
+                settings["multi_target_order"].append({"mode": target_mode, "name": name})
+                seen.add(key)
+    for target_mode in MODES:
+        for name in settings["multi_targets"][target_mode]:
+            key = (target_mode, name)
+            if key not in {(entry["mode"], entry["name"]) for entry in settings["multi_target_order"]}:
+                settings["multi_target_order"].append({"mode": target_mode, "name": name})
     legacy = str(raw.get("last_server", "")).strip()
     if legacy and not settings["last_servers"].get(settings["last_mode"]):
         settings["last_servers"][settings["last_mode"]] = legacy
@@ -97,6 +124,24 @@ def save_settings(settings: dict[str, Any]) -> None:
         "last_mode": last_mode,
         "last_server": last_servers.get(last_mode, ""),
         "last_servers": {mode: last_servers.get(mode, "") for mode in MODES},
+        "multi_targets": {
+            mode: list(dict.fromkeys(
+                str(name).strip()
+                for name in (settings.get("multi_targets", {}).get(mode, []) or [])
+                if str(name).strip()
+            ))
+            for mode in MODES
+        },
+        "multi_target_order": [
+            {"mode": str(entry.get("mode", "")).strip().upper(), "name": str(entry.get("name", "")).strip()}
+            for entry in (settings.get("multi_target_order", []) or [])
+            if isinstance(entry, dict)
+            and str(entry.get("mode", "")).strip().upper() in MODES
+            and str(entry.get("name", "")).strip()
+            and str(entry.get("name", "")).strip() in settings.get("multi_targets", {}).get(
+                str(entry.get("mode", "")).strip().upper(), []
+            )
+        ],
         "process_names": settings.get("process_names", list(DEFAULT_PROCESS_NAMES)),
     }
     SETTINGS_PATH.write_text(

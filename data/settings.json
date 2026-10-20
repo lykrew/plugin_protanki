@@ -1,12 +1,31 @@
 {
   "last_mode": "CP",
-  "last_server": "",
+  "last_server": "1",
   "last_servers": {
     "DM": "",
     "TDM": "",
     "CTF": "",
-    "CP": ""
+    "CP": "1"
   },
+  "multi_targets": {
+    "DM": [],
+    "TDM": [],
+    "CTF": [],
+    "CP": [
+      "2",
+      "1"
+    ]
+  },
+  "multi_target_order": [
+    {
+      "mode": "CP",
+      "name": "2"
+    },
+    {
+      "mode": "CP",
+      "name": "1"
+    }
+  ],
   "process_names": [
     "ProTanki.exe",
     "ProTanki",

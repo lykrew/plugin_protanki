@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import ctypes
 import re
@@ -12,7 +12,9 @@ import psutil
 
 
 POLL_SECONDS = 0.12
-RETRY_SECONDS = 0.30
+RETRY_SECONDS = 0.12
+MULTI_TARGET_DWELL_SECONDS = 0.12
+ROW_SELECT_SETTLE_SECONDS = 0.18
 
 _ocr_lock = threading.Lock()
 _ocr_engine = None
@@ -97,12 +99,16 @@ class BattleJoinWatcher:
 
     def __init__(
         self,
-        link: str,
+        link: str | list[str],
         process_names: list[str],
         on_status: Callable[[str], None],
         on_finished: Callable[[str], None],
     ) -> None:
-        self.battle_id = battle_id_from_link(link)
+        links = [link] if isinstance(link, str) else link
+        self.battle_ids = list(dict.fromkeys(
+            battle_id_from_link(value) for value in links if battle_id_from_link(value)
+        ))
+        self.battle_id = self.battle_ids[0] if self.battle_ids else ""
         self.process_names = process_names
         self.on_status = on_status
         self.on_finished = on_finished
@@ -114,7 +120,7 @@ class BattleJoinWatcher:
         return self._thread is not None and self._thread.is_alive()
 
     def start(self) -> None:
-        if not self.battle_id:
+        if not self.battle_ids:
             raise ValueError("Enter a battle link like #/battle/0123456789abcdef")
         if self.running:
             return
@@ -167,10 +173,38 @@ class BattleJoinWatcher:
 
         last_attempt = 0.0
         target_confirmed = False
-        command_sent = False
         pending_join = False
         next_full_check = 0.0
-        self._say("Looking for the selected battle\u2026")
+        target_index = 0
+        target_confirmed_at: float | None = None
+        list_row_centers: list[int] | None = None
+        list_row_index = 0
+        last_row_click_at = 0.0
+        target_rows: dict[str, int] = {}
+        last_clicked_row_y: int | None = None
+        cached_row_attempts = 0
+
+        def advance_target() -> bool:
+            nonlocal target_index, target_confirmed, pending_join, next_full_check
+            nonlocal target_confirmed_at, list_row_centers, list_row_index, last_row_click_at
+            nonlocal last_clicked_row_y, cached_row_attempts
+            if len(self.battle_ids) < 2:
+                return False
+            target_index = (target_index + 1) % len(self.battle_ids)
+            self.battle_id = self.battle_ids[target_index]
+            target_confirmed = False
+            pending_join = False
+            next_full_check = 0.0
+            target_confirmed_at = None
+            list_row_centers = None
+            list_row_index = 0
+            last_row_click_at = 0.0
+            last_clicked_row_y = None
+            cached_row_attempts = 0
+            self._say(f"Checking battle {target_index + 1}/{len(self.battle_ids)}...")
+            return True
+
+        self._say(f"Checking battle 1/{len(self.battle_ids)}…")
 
         while not self._stop.is_set():
             current_window = _find_game_window(self.process_names)
@@ -190,7 +224,9 @@ class BattleJoinWatcher:
             try:
                 screen_width = current_window.width
                 screen_height = current_window.height
-                panel_left = int(screen_width * 0.665)
+                # Include the left edge of the battle-link field in the info
+                # panel so the selected battle ID is visible to OCR.
+                panel_left = int(screen_width * 0.615)
                 panel_top = int(screen_height * 0.405)
                 panel_right = int(screen_width * 0.998)
                 panel_bottom = int(screen_height * 0.999)
@@ -239,6 +275,7 @@ class BattleJoinWatcher:
                         panel_offset=(panel_left, panel_top),
                     )
                     next_full_check = time.monotonic() + 1.5
+                    full_check = True
             except Exception as exc:
                 self._finish(f"Could not read the game screen: {exc}")
                 return
@@ -250,32 +287,69 @@ class BattleJoinWatcher:
                 # The click did not change the battle view. Resume the lightweight
                 # seat-only scan and retry promptly instead of waiting several seconds.
                 pending_join = False
+                # The click may have missed while the seat is still open.
+                # Stay on this battle and retry it; rotating here used to
+                # abandon the only target that had an available place.
 
             if not state.selected:
                 if target_confirmed:
-                    self._finish("Экран боя изменился. Проверьте вход в ProTanki.")
+                    if advance_target():
+                        continue
+                    self._finish("The selected battle changed unexpectedly. Check ProTanki.")
                     return
-                if not command_sent:
-                    chat_image = ImageGrab.grab(
-                        bbox=(
-                            current_window.left + int(screen_width * 0.005),
-                            current_window.top + int(screen_height * 0.945),
-                            current_window.left + int(screen_width * 0.27),
-                            current_window.top + int(screen_height * 0.99),
-                        ),
-                        all_screens=True,
-                    )
-                    if not _chat_input_is_empty(ocr, chat_image):
-                        self._finish("Clear the ProTanki chat input, then start monitoring again.")
-                        return
-                    _send_showbattle(current_window, self.battle_id)
-                    command_sent = True
-                    self._say("Searching for the saved battle in ProTanki\u2026")
+
+                now = time.monotonic()
+                if self.battle_id in target_rows:
+                    cached_y = target_rows[self.battle_id]
+                    if last_clicked_row_y != cached_y:
+                        _click_ratio(current_window, 0.50, cached_y / screen_height)
+                        last_clicked_row_y = cached_y
+                        last_row_click_at = now
+                        cached_row_attempts = 1
+                        self._say(f"Rechecking battle {target_index + 1}/{len(self.battle_ids)}...")
+                    elif now - last_row_click_at >= 0.45:
+                        if cached_row_attempts >= 2:
+                            target_rows.pop(self.battle_id, None)
+                            list_row_centers = None
+                            list_row_index = 0
+                            last_clicked_row_y = None
+                            cached_row_attempts = 0
+                        else:
+                            _click_ratio(current_window, 0.50, cached_y / screen_height)
+                            last_row_click_at = now
+                            cached_row_attempts += 1
                 else:
-                    self._say("Waiting for ProTanki to open the saved battle\u2026")
+                    if list_row_centers is None:
+                        list_image = ImageGrab.grab(
+                            bbox=(
+                                current_window.left + int(screen_width * 0.335),
+                                current_window.top + int(screen_height * 0.11),
+                                current_window.left + int(screen_width * 0.66),
+                                current_window.top + int(screen_height * 0.56),
+                            ),
+                            all_screens=True,
+                        )
+                        list_row_centers = _battle_list_row_centers(ocr, list_image, screen_height)
+                        list_row_index = 0
+                    if list_row_index < len(list_row_centers):
+                        if now - last_row_click_at >= ROW_SELECT_SETTLE_SECONDS:
+                            row_y = list_row_centers[list_row_index]
+                            _click_ratio(current_window, 0.50, row_y / screen_height)
+                            list_row_index += 1
+                            last_clicked_row_y = row_y
+                            last_row_click_at = now
+                            self._say(f"Selecting saved battle {target_index + 1}/{len(self.battle_ids)}...")
+                    elif not advance_target():
+                        self._finish("Saved battle was not found in the visible battle list.")
+                        return
                 self._stop.wait(POLL_SECONDS)
                 continue
 
+            if last_clicked_row_y is not None:
+                target_rows.setdefault(self.battle_id, last_clicked_row_y)
+            cached_row_attempts = 0
+            if not target_confirmed:
+                target_confirmed_at = time.monotonic()
             target_confirmed = True
             if not pending_join:
                 # While idling, the cropped seat scan is sufficient. Schedule a
@@ -283,6 +357,13 @@ class BattleJoinWatcher:
                 next_full_check = float("inf")
             free = state.red_free + state.blue_free
             if free == 0:
+                if (
+                    len(self.battle_ids) > 1
+                    and target_confirmed_at is not None
+                    and time.monotonic() - target_confirmed_at >= MULTI_TARGET_DWELL_SECONDS
+                ):
+                    advance_target()
+                    continue
                 self._say("Battle found; waiting for an empty player slot\u2026")
                 self._stop.wait(POLL_SECONDS)
                 continue
@@ -297,9 +378,11 @@ class BattleJoinWatcher:
                 self._stop.wait(POLL_SECONDS)
                 continue
 
-            # Prefer the team with more free slots; try red first if tied.
-            button_x = 0.715 if state.red_free >= state.blue_free and state.red_free else 0.955
-            _click_ratio(current_window, button_x, 0.96)
+            # The game places the red and blue Join buttons at the bottom of
+            # the roster panels. Click their centers; edge clicks can animate
+            # the button without activating its hit target.
+            button_x = 0.716 if state.red_free >= state.blue_free and state.red_free else 0.953
+            _click_ratio(current_window, button_x, 0.956)
             last_attempt = now
             pending_join = True
             next_full_check = now + RETRY_SECONDS
@@ -434,30 +517,35 @@ def _read_free_seats(
     return red_free, blue_free
 
 
-def _chat_input_is_empty(ocr, chat_image) -> bool:
-    result = ocr(chat_image)
-    return not any(str(text).strip() for text in (result.txts or []))
+def _battle_list_row_centers(ocr, image, screen_height: int) -> list[int]:
+    """Find row centers in the visible battle list from OCR text boxes."""
+    result = ocr(image)
+    boxes = result.boxes
+    if boxes is None:
+        return []
+    y_centers: list[float] = []
+    for index, text in enumerate(result.txts or []):
+        if not str(text).strip() or index >= len(boxes):
+            continue
+        box = boxes[index]
+        x = sum(float(point[0]) for point in box) / 4
+        y = sum(float(point[1]) for point in box) / 4
+        if image.width * 0.03 <= x <= image.width * 0.97:
+            y_centers.append(y)
+    if not y_centers:
+        return []
 
+    y_centers.sort()
+    cluster_gap = max(8, int(image.height * 0.035))
+    clusters: list[list[float]] = [[y_centers[0]]]
+    for y in y_centers[1:]:
+        if y - clusters[-1][-1] <= cluster_gap:
+            clusters[-1].append(y)
+        else:
+            clusters.append([y])
 
-def _send_showbattle(window: GameWindow, target_id: str) -> None:
-    user32 = ctypes.windll.user32
-    user32.SetCursorPos.argtypes = [ctypes.c_int, ctypes.c_int]
-    user32.mouse_event.argtypes = [wintypes.DWORD, wintypes.DWORD, wintypes.DWORD, wintypes.DWORD, ctypes.c_size_t]
-    user32.keybd_event.argtypes = [wintypes.BYTE, wintypes.BYTE, wintypes.DWORD, ctypes.c_size_t]
-    user32.SetCursorPos(window.left + int(window.width * 0.14), window.top + int(window.height * 0.965))
-    user32.mouse_event(0x0002, 0, 0, 0, 0)
-    user32.mouse_event(0x0004, 0, 0, 0, 0)
-
-    keybd_event = user32.keybd_event
-    unicode_flag = 0x0004
-    key_up_flag = 0x0002
-    command = f"/showbattle #/battle/{target_id}"
-    for character in command:
-        scan_code = ord(character)
-        keybd_event(0, scan_code, unicode_flag, 0)
-        keybd_event(0, scan_code, unicode_flag | key_up_flag, 0)
-    keybd_event(0x0D, 0, 0, 0)
-    keybd_event(0x0D, 0, key_up_flag, 0)
+    list_top = int(screen_height * 0.11)
+    return [round(list_top + sum(cluster) / len(cluster)) for cluster in clusters]
 
 
 def _click_ratio(window: GameWindow, x_ratio: float, y_ratio: float) -> None:
