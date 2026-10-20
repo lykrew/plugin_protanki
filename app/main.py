@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import customtkinter as ctk
-from tkinter import messagebox
+from tkinter import Canvas, messagebox
 
-from app.game_automation import BattleJoinWatcher
+from app.game_automation import BattleJoinWatcher, preload_ocr
 from app.game_watch import find_game_process
-from app.notify import play_join_bell
+from app.notify import play_join_success
 from app.paths import MODES
 from app.servers import (
     add_server,
@@ -17,14 +17,14 @@ from app.servers import (
 )
 
 POLL_MS = 2000
-BG = "#090E18"
-SURFACE = "#111A29"
-SURFACE_2 = "#172235"
-LINE = "#26364C"
-TEXT = "#F4F8FF"
-MUTED = "#91A0B5"
-CYAN = "#76E4F7"
-CYAN_DARK = "#153C50"
+BG = "#090A0C"
+SURFACE = "#17181B"
+SURFACE_2 = "#202125"
+LINE = "#44464B"
+TEXT = "#F5F5F6"
+MUTED = "#A5A6AA"
+CYAN = "#E5E6E8"  # Neutral highlight kept for existing widget styles.
+CYAN_DARK = "#424348"
 
 
 class CompanionApp(ctk.CTk):
@@ -35,6 +35,13 @@ class CompanionApp(ctk.CTk):
         self.minsize(960, 740)
         self.state("zoomed")
         self.configure(fg_color=BG)
+        self._backdrop = Canvas(self, highlightthickness=0, bd=0, bg=BG)
+        self._backdrop.place(x=0, y=0, relwidth=1, relheight=1)
+        # Canvas.lower() addresses canvas items; use Tk's window stacking
+        # command to place the backdrop behind the CustomTkinter widgets.
+        self.tk.call("lower", self._backdrop._w)
+        self._backdrop_job = None
+        self._backdrop.bind("<Configure>", self._schedule_backdrop)
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("blue")
 
@@ -47,25 +54,83 @@ class CompanionApp(ctk.CTk):
         self.status_var = ctk.StringVar(value="Проверяем игру…")
         self.selected_var = ctk.StringVar(value="")
         self.auto_join_status_var = ctk.StringVar(value="Автоподключение выключено")
-        self.bell_var = ctk.BooleanVar(value=bool(self.settings.get("bell_enabled", True)))
         self.name_var = ctk.StringVar()
         self.note_var = ctk.StringVar()
         self.battle_link_var = ctk.StringVar()
         self.auto_joiner: BattleJoinWatcher | None = None
+        self._ocr_result: str | None = None
         self._build()
+        self.auto_join_button.configure(state="disabled", text="Подготавливаю распознавание…")
+        preload_ocr(self._store_ocr_result)
+        self.after(50, self._poll_ocr_ready)
         self._refresh_list()
         self._restore_selection()
         self._poll_game()
         self.protocol("WM_DELETE_WINDOW", self._close)
+
+    @staticmethod
+    def _blend(first: str, second: str, amount: float) -> str:
+        a = tuple(int(first[index:index + 2], 16) for index in (1, 3, 5))
+        b = tuple(int(second[index:index + 2], 16) for index in (1, 3, 5))
+        channels = tuple(round(x + (y - x) * amount) for x, y in zip(a, b))
+        return "#" + "".join(f"{channel:02X}" for channel in channels)
+
+    def _schedule_backdrop(self, _event=None) -> None:
+        if self._backdrop_job is not None:
+            try:
+                self.after_cancel(self._backdrop_job)
+            except Exception:
+                pass
+        self._backdrop_job = self.after(90, self._paint_backdrop)
+
+    def _paint_backdrop(self) -> None:
+        self._backdrop_job = None
+        width = max(1, self._backdrop.winfo_width())
+        height = max(1, self._backdrop.winfo_height())
+        self._backdrop.delete("backdrop")
+
+        bands = 90
+        band_height = max(1, height // bands)
+        for index in range(bands):
+            ratio = index / max(1, bands - 1)
+            color = self._blend("#17181B", BG, ratio * 0.75)
+            y = index * height / bands
+            self._backdrop.create_rectangle(
+                0, y, width, y + band_height + 1,
+                fill=color, outline="", tags="backdrop",
+            )
+
+        # Soft blue and violet light pools give the dark panels a frosted-glass backdrop.
+        radius = min(width, height) * 0.64
+        for center_x, center_y, tint, opacity in (
+            (width * 0.10, height * 0.10, "#74767C", 0.16),
+            (width * 0.92, height * 0.82, "#55575D", 0.12),
+        ):
+            for step in range(30):
+                scale = 1.0 - step / 30
+                current_radius = radius * scale
+                alpha = opacity * (1.0 - scale) ** 1.6
+                color = self._blend("#111215", tint, alpha)
+                self._backdrop.create_oval(
+                    center_x - current_radius, center_y - current_radius,
+                    center_x + current_radius, center_y + current_radius,
+                    fill=color, outline="", tags="backdrop",
+                )
+
+    @staticmethod
+    def _add_glass_edge(frame: ctk.CTkFrame) -> None:
+        sheen = ctk.CTkFrame(frame, height=1, corner_radius=1, fg_color="#77797F")
+        sheen.place(relx=0.045, rely=0.006, relwidth=0.91)
 
     def _build(self) -> None:
         shell = ctk.CTkFrame(self, fg_color="transparent")
         shell.pack(fill="both", expand=True, padx=26, pady=24)
 
         top = ctk.CTkFrame(
-            shell, fg_color=SURFACE, corner_radius=26, border_width=1, border_color=LINE
+            shell, fg_color=SURFACE, corner_radius=26, border_width=1, border_color="#56585E"
         )
         top.pack(fill="x", pady=(0, 18))
+        self._add_glass_edge(top)
         brand = ctk.CTkFrame(top, fg_color="transparent")
         brand.pack(side="left", padx=22, pady=18)
         ctk.CTkLabel(
@@ -89,9 +154,9 @@ class CompanionApp(ctk.CTk):
             height=38,
             corner_radius=14,
             selected_color=CYAN_DARK,
-            selected_hover_color="#1E5268",
-            unselected_color="#0D1522",
-            unselected_hover_color="#1B293C",
+            selected_hover_color="#55575D",
+            unselected_color="#141518",
+            unselected_hover_color="#303136",
             text_color=TEXT,
             font=ctk.CTkFont(size=13, weight="bold"),
         )
@@ -99,15 +164,16 @@ class CompanionApp(ctk.CTk):
         self.mode_buttons.set(self.current_mode)
 
         status_bar = ctk.CTkFrame(
-            shell, fg_color="#10202C", corner_radius=16, border_width=1, border_color="#244454"
+            shell, fg_color="#202125", corner_radius=18, border_width=1, border_color="#52545A"
         )
         status_bar.pack(fill="x", pady=(0, 18))
+        self._add_glass_edge(status_bar)
         ctk.CTkLabel(
             status_bar, text="●", text_color=CYAN,
             font=ctk.CTkFont(size=12, weight="bold"),
         ).pack(side="left", padx=(16, 9), pady=10)
         ctk.CTkLabel(
-            status_bar, textvariable=self.status_var, text_color="#C7D4E4",
+            status_bar, textvariable=self.status_var, text_color="#C9CACE",
             font=ctk.CTkFont(size=12),
         ).pack(side="left", pady=10)
         ctk.CTkLabel(
@@ -122,9 +188,10 @@ class CompanionApp(ctk.CTk):
         content.grid_rowconfigure(0, weight=1)
 
         list_card = ctk.CTkFrame(
-            content, fg_color=SURFACE, corner_radius=26, border_width=1, border_color=LINE
+            content, fg_color=SURFACE, corner_radius=26, border_width=1, border_color="#56585E"
         )
         list_card.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
+        self._add_glass_edge(list_card)
         ctk.CTkLabel(
             list_card, text="Сохранённые бои", text_color=TEXT,
             font=ctk.CTkFont(size=20, weight="bold"),
@@ -140,9 +207,10 @@ class CompanionApp(ctk.CTk):
         self.server_rows: list[ctk.CTkBaseClass] = []
 
         form = ctk.CTkFrame(
-            content, fg_color=SURFACE, corner_radius=26, border_width=1, border_color=LINE
+            content, fg_color=SURFACE, corner_radius=26, border_width=1, border_color="#56585E"
         )
         form.grid(row=0, column=1, sticky="nsew", padx=(10, 0))
+        self._add_glass_edge(form)
         ctk.CTkLabel(
             form, text="Автопилот", text_color=TEXT,
             font=ctk.CTkFont(size=20, weight="bold"),
@@ -155,7 +223,7 @@ class CompanionApp(ctk.CTk):
         ).pack(anchor="w", padx=22, pady=(0, 18))
 
         ctk.CTkLabel(
-            form, text="ССЫЛКА НА БОЙ", text_color="#AFC0D3",
+            form, text="ССЫЛКА НА БОЙ", text_color="#B9BABE",
             font=ctk.CTkFont(size=10, weight="bold"),
         ).pack(anchor="w", padx=22, pady=(0, 7))
         link_row = ctk.CTkFrame(form, fg_color="transparent")
@@ -166,53 +234,55 @@ class CompanionApp(ctk.CTk):
             placeholder_text="#/battle/…",
             height=44,
             corner_radius=14,
-            fg_color="#0B1320",
+            fg_color="#111215",
             border_color=LINE,
             text_color=TEXT,
-            placeholder_text_color="#64748B",
+            placeholder_text_color="#77797F",
             font=ctk.CTkFont(size=13),
         )
         self.link_entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
         self._bind_paste(self.link_entry)
         ctk.CTkButton(
             link_row, text="Вставить", width=84, height=44, corner_radius=14,
-            fg_color="#213149", hover_color="#2B405C", text_color=TEXT,
+            fg_color="#303136", hover_color="#45474D", text_color=TEXT,
+            border_width=1, border_color="#686A70",
             command=self._paste_battle_link,
         ).pack(side="right")
 
         ctk.CTkLabel(
-            form, text="Название", text_color="#AFC0D3",
+            form, text="Название", text_color="#B9BABE",
             font=ctk.CTkFont(size=10, weight="bold"),
         ).pack(anchor="w", padx=22, pady=(16, 7))
         self.name_entry = ctk.CTkEntry(
             form, textvariable=self.name_var, placeholder_text="Например, Фарм",
-            height=42, corner_radius=14, fg_color="#0B1320", border_color=LINE,
-            text_color=TEXT, placeholder_text_color="#64748B",
+            height=42, corner_radius=14, fg_color="#111215", border_color=LINE,
+            text_color=TEXT, placeholder_text_color="#77797F",
         )
         self.name_entry.pack(fill="x", padx=22)
         self._bind_paste(self.name_entry)
 
         ctk.CTkLabel(
-            form, text="Заметка", text_color="#AFC0D3",
+            form, text="Заметка", text_color="#B9BABE",
             font=ctk.CTkFont(size=10, weight="bold"),
         ).pack(anchor="w", padx=22, pady=(13, 7))
         self.note_entry = ctk.CTkEntry(
             form, textvariable=self.note_var, placeholder_text="Необязательно",
-            height=42, corner_radius=14, fg_color="#0B1320", border_color=LINE,
-            text_color=TEXT, placeholder_text_color="#64748B",
+            height=42, corner_radius=14, fg_color="#111215", border_color=LINE,
+            text_color=TEXT, placeholder_text_color="#77797F",
         )
         self.note_entry.pack(fill="x", padx=22)
         self._bind_paste(self.note_entry)
 
         ctk.CTkButton(
             form, text="Сохранить бой", command=self._save_server,
-            height=42, corner_radius=14, fg_color="#25364D", hover_color="#304763",
+            height=42, corner_radius=14, fg_color="#33353A", hover_color="#484A50",
+            border_width=1, border_color="#66686E",
             text_color=TEXT, font=ctk.CTkFont(size=13, weight="bold"),
         ).pack(fill="x", padx=22, pady=(16, 7))
         ctk.CTkButton(
             form, text="Удалить выбранный", command=self._delete_selected,
-            height=38, corner_radius=14, fg_color="transparent", hover_color="#382632",
-            border_width=1, border_color="#61404D", text_color="#EBA8B5",
+            height=38, corner_radius=14, fg_color="transparent", hover_color="#303136",
+            border_width=1, border_color="#66686E", text_color="#D0D1D4",
         ).pack(fill="x", padx=22, pady=(0, 12))
         self.auto_join_button = ctk.CTkButton(
             form,
@@ -221,8 +291,10 @@ class CompanionApp(ctk.CTk):
             height=50,
             corner_radius=16,
             fg_color=CYAN,
-            hover_color="#9BF0FF",
-            text_color="#07131D",
+            hover_color="#FFFFFF",
+            border_width=1,
+            border_color="#FFFFFF",
+            text_color="#111215",
             font=ctk.CTkFont(size=14, weight="bold"),
         )
         self.auto_join_button.pack(fill="x", padx=22, pady=(4, 5))
@@ -230,16 +302,6 @@ class CompanionApp(ctk.CTk):
             form, textvariable=self.selected_var, text_color=MUTED,
             font=ctk.CTkFont(size=11), wraplength=360, justify="left",
         ).pack(anchor="w", padx=22, pady=(3, 3))
-        ctk.CTkCheckBox(
-            form, text="Звонок при выборе боя", variable=self.bell_var,
-            command=self._toggle_bell, text_color="#B7C5D7",
-            fg_color=CYAN_DARK, hover_color="#28627B", border_color="#52657D",
-        ).pack(anchor="w", padx=22, pady=(8, 4))
-        ctk.CTkButton(
-            form, text="Проверить звук", command=self._test_bell,
-            height=34, corner_radius=12, fg_color="transparent",
-            hover_color="#1C2A3D", text_color=MUTED,
-        ).pack(anchor="w", padx=16, pady=(0, 12))
 
     def _bind_paste(self, entry: ctk.CTkEntry) -> None:
         entry.bind("<Control-v>", lambda event, target=entry: self._paste_entry(target))
@@ -292,10 +354,10 @@ class CompanionApp(ctk.CTk):
             note = item.get("note", "")
             card = ctk.CTkFrame(
                 self.server_list,
-                fg_color="#1B2A3C" if name == selected else SURFACE_2,
+                fg_color="#303136" if name == selected else SURFACE_2,
                 corner_radius=18,
                 border_width=1,
-                border_color="#4A8192" if name == selected else "#202D41",
+                border_color="#BFC0C4" if name == selected else "#44464B",
             )
             card.pack(fill="x", padx=4, pady=5)
             self.server_rows.append(card)
@@ -316,12 +378,12 @@ class CompanionApp(ctk.CTk):
                     font=ctk.CTkFont(size=11),
                 ).pack(anchor="w", fill="x", pady=(3, 0))
             for widget in (card, text_box, *text_box.winfo_children()):
-                widget.bind("<Button-1>", lambda event, value=name: self._select_server(value, ring=True))
+                widget.bind("<Button-1>", lambda event, value=name: self._select_server(value))
 
     def _selected_name(self) -> str:
         return str(self.settings.setdefault("last_servers", {}).get(self.current_mode, "") or "")
 
-    def _select_server(self, name: str, ring: bool = False) -> None:
+    def _select_server(self, name: str) -> None:
         self.settings["last_mode"] = self.current_mode
         self.settings.setdefault("last_servers", {})[self.current_mode] = name
         save_settings(self.settings)
@@ -335,20 +397,6 @@ class CompanionApp(ctk.CTk):
             self.note_var.set(item.get("note", ""))
             self.battle_link_var.set(item.get("battle_link", ""))
         self._refresh_list()
-        if ring:
-            self._maybe_ring()
-
-    def _toggle_bell(self) -> None:
-        self.settings["bell_enabled"] = bool(self.bell_var.get())
-        save_settings(self.settings)
-
-    def _test_bell(self) -> None:
-        play_join_bell()
-
-    def _maybe_ring(self) -> None:
-        if self.bell_var.get():
-            play_join_bell()
-
     def _restore_selection(self) -> None:
         last = self._selected_name()
         item = next(
@@ -380,7 +428,7 @@ class CompanionApp(ctk.CTk):
             return
         add_server(self.catalog, self.current_mode, name, note, battle_link)
         save_catalog(self.catalog)
-        self._select_server(name, ring=True)
+        self._select_server(name)
 
     def _delete_selected(self) -> None:
         name = self._selected_name()
@@ -416,11 +464,34 @@ class CompanionApp(ctk.CTk):
             return
         self.auto_join_button.configure(text="Остановить автоподключение")
 
+    def _store_ocr_result(self, error: str) -> None:
+        # The loader runs on a worker thread; Tk widgets are updated only by
+        # _poll_ocr_ready on the main UI thread.
+        self._ocr_result = error
+
+    def _poll_ocr_ready(self) -> None:
+        if self._ocr_result is None:
+            self.after(50, self._poll_ocr_ready)
+            return
+        self._ocr_ready(self._ocr_result)
+
+    def _ocr_ready(self, error: str) -> None:
+        self.auto_join_button.configure(
+            state="normal",
+            text="Начать автоподключение",
+        )
+        if error:
+            self.auto_join_status_var.set("Не удалось подготовить распознавание; запуск покажет причину")
+        else:
+            self.auto_join_status_var.set("Готово к быстрому подключению")
+
     def _auto_join_finished(self, text: str) -> None:
         try:
             def apply_result() -> None:
                 self.auto_join_status_var.set(text)
-                self.auto_join_button.configure(text="Начать автоподключение")
+                self.auto_join_button.configure(text="Начать автоподключение", state="normal")
+                if text == "Вход в бой выполнен.":
+                    play_join_success()
 
             self.after(0, apply_result)
         except RuntimeError:

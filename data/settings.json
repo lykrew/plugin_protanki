@@ -1,16 +1,15 @@
 {
   "last_mode": "CP",
-  "last_server": "cp1",
+  "last_server": "",
   "last_servers": {
     "DM": "",
     "TDM": "",
     "CTF": "",
-    "CP": "cp1"
+    "CP": ""
   },
   "process_names": [
     "ProTanki.exe",
     "ProTanki",
     "protanki.exe"
-  ],
-  "bell_enabled": true
+  ]
 }

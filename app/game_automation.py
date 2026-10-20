@@ -11,8 +11,54 @@ from typing import Callable
 import psutil
 
 
-POLL_SECONDS = 1.5
-RETRY_SECONDS = 8.0
+POLL_SECONDS = 0.12
+RETRY_SECONDS = 0.30
+
+_ocr_lock = threading.Lock()
+_ocr_engine = None
+
+
+def _get_ocr_engine():
+    global _ocr_engine
+    if _ocr_engine is None:
+        with _ocr_lock:
+            if _ocr_engine is None:
+                from rapidocr import EngineType, LangDet, LangRec, ModelType, OCRVersion, RapidOCR
+
+                engine = RapidOCR(
+                    params={
+                        # All relevant labels are horizontal; skipping orientation
+                        # classification avoids one extra model pass per frame.
+                        "Global.use_cls": False,
+                        "Det.engine_type": EngineType.ONNXRUNTIME,
+                        "Det.lang_type": LangDet.MULTI,
+                        "Det.model_type": ModelType.MOBILE,
+                        "Det.ocr_version": OCRVersion.PPOCRV5,
+                        "Rec.engine_type": EngineType.ONNXRUNTIME,
+                        "Rec.lang_type": LangRec.CYRILLIC,
+                        "Rec.model_type": ModelType.MOBILE,
+                        "Rec.ocr_version": OCRVersion.PPOCRV5,
+                    }
+                )
+                # Run a tiny image once so the first live screenshot avoids runtime setup.
+                from PIL import Image
+                engine(Image.new("RGB", (96, 48), "black"))
+                _ocr_engine = engine
+    return _ocr_engine
+
+
+def preload_ocr(on_ready: Callable[[str], None] | None = None) -> None:
+    """Load and warm OCR before enabling auto-join."""
+    def load() -> None:
+        error = ""
+        try:
+            _get_ocr_engine()
+        except Exception as exc:
+            error = str(exc)
+        if on_ready is not None:
+            on_ready(error)
+
+    threading.Thread(target=load, daemon=True, name="protanki-ocr-preload").start()
 
 
 def battle_id_from_link(value: str) -> str:
@@ -93,21 +139,7 @@ class BattleJoinWatcher:
 
         try:
             from PIL import ImageGrab
-            from rapidocr import EngineType, LangDet, LangRec, ModelType, OCRVersion, RapidOCR
-
-            # Russian OCR runs locally. RapidOCR fetches its model files the first time.
-            ocr = RapidOCR(
-                params={
-                    "Det.engine_type": EngineType.ONNXRUNTIME,
-                    "Det.lang_type": LangDet.MULTI,
-                    "Det.model_type": ModelType.MOBILE,
-                    "Det.ocr_version": OCRVersion.PPOCRV5,
-                    "Rec.engine_type": EngineType.ONNXRUNTIME,
-                    "Rec.lang_type": LangRec.CYRILLIC,
-                    "Rec.model_type": ModelType.MOBILE,
-                    "Rec.ocr_version": OCRVersion.PPOCRV5,
-                }
-            )
+            ocr = _get_ocr_engine()
         except Exception as exc:
             self._finish(f"OCR setup failed: {exc}")
             return
@@ -118,17 +150,26 @@ class BattleJoinWatcher:
             return
 
         user32 = ctypes.windll.user32
+        # HWND is pointer-sized on 64-bit Windows; ctypes defaults undeclared
+        # return values to 32-bit int, which can truncate the active window.
+        user32.GetForegroundWindow.restype = wintypes.HWND
+        user32.GetForegroundWindow.argtypes = []
+        user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
         # SW_RESTORE also unmaximizes a maximized client and can move it back
         # to its stale normal-window bounds. Restore only when minimized.
         if user32.IsIconic(window.handle):
             user32.ShowWindow(window.handle, 9)  # SW_RESTORE
-        user32.SetForegroundWindow(window.handle)
-        time.sleep(0.3)
+        if int(user32.GetForegroundWindow() or 0) != window.handle:
+            user32.SetForegroundWindow(window.handle)
+            focus_deadline = time.monotonic() + 0.18
+            while int(user32.GetForegroundWindow() or 0) != window.handle and time.monotonic() < focus_deadline:
+                time.sleep(0.01)
 
         last_attempt = 0.0
         target_confirmed = False
         command_sent = False
         pending_join = False
+        next_full_check = 0.0
         self._say("Looking for the selected battle\u2026")
 
         while not self._stop.is_set():
@@ -138,32 +179,93 @@ class BattleJoinWatcher:
                 return
 
             foreground = user32.GetForegroundWindow()
-            if foreground != current_window.handle:
+            foreground_pid = wintypes.DWORD()
+            if foreground:
+                user32.GetWindowThreadProcessId(foreground, ctypes.byref(foreground_pid))
+            if foreground_pid.value != current_window.pid:
                 self._say("Monitoring paused. Bring ProTanki to the front to continue.")
                 self._stop.wait(POLL_SECONDS)
                 continue
 
             try:
+                screen_width = current_window.width
+                screen_height = current_window.height
+                panel_left = int(screen_width * 0.665)
+                panel_top = int(screen_height * 0.405)
+                panel_right = int(screen_width * 0.998)
+                panel_bottom = int(screen_height * 0.999)
                 image = ImageGrab.grab(
                     bbox=(
-                        current_window.left,
-                        current_window.top,
-                        current_window.right,
-                        current_window.bottom,
+                        current_window.left + panel_left,
+                        current_window.top + panel_top,
+                        current_window.left + panel_right,
+                        current_window.top + panel_bottom,
                     ),
                     all_screens=True,
                 )
-                state = _read_battle_screen(ocr, image, self.battle_id)
+                full_check = not target_confirmed or time.monotonic() >= next_full_check
+                if full_check:
+                    state = _read_battle_screen(
+                        ocr,
+                        image,
+                        self.battle_id,
+                        screen_width=screen_width,
+                        screen_height=screen_height,
+                        panel_offset=(panel_left, panel_top),
+                    )
+                    next_full_check = time.monotonic() + 1.5
+                    full_check = True
+                else:
+                    seats_top = max(0, int(screen_height * 0.47) - panel_top)
+                    seats_bottom = min(image.height, int(screen_height * 0.88) - panel_top)
+                    seats_image = image.crop((0, seats_top, image.width, seats_bottom))
+                    red_free, blue_free = _read_free_seats(
+                        ocr,
+                        seats_image,
+                        screen_width=screen_width,
+                        screen_height=screen_height,
+                        panel_offset=(panel_left, panel_top + seats_top),
+                    )
+                    state = BattleScreen(True, red_free, blue_free, True)
+                if pending_join and state.red_free + state.blue_free == 0:
+                    # Only pay for a full-screen OCR pass after the attempted slot
+                    # disappears; when it is still free, retry from the fast scan.
+                    state = _read_battle_screen(
+                        ocr,
+                        image,
+                        self.battle_id,
+                        screen_width=screen_width,
+                        screen_height=screen_height,
+                        panel_offset=(panel_left, panel_top),
+                    )
+                    next_full_check = time.monotonic() + 1.5
             except Exception as exc:
                 self._finish(f"Could not read the game screen: {exc}")
                 return
 
+            if pending_join and full_check and (not state.selected or not state.join_buttons_visible):
+                self._finish("Вход в бой выполнен.")
+                return
+            if pending_join and full_check:
+                # The click did not change the battle view. Resume the lightweight
+                # seat-only scan and retry promptly instead of waiting several seconds.
+                pending_join = False
+
             if not state.selected:
                 if target_confirmed:
-                    self._finish("The battle screen changed. Check ProTanki to confirm entry.")
+                    self._finish("Экран боя изменился. Проверьте вход в ProTanki.")
                     return
                 if not command_sent:
-                    if not _chat_input_is_empty(ocr, image):
+                    chat_image = ImageGrab.grab(
+                        bbox=(
+                            current_window.left + int(screen_width * 0.005),
+                            current_window.top + int(screen_height * 0.945),
+                            current_window.left + int(screen_width * 0.27),
+                            current_window.top + int(screen_height * 0.99),
+                        ),
+                        all_screens=True,
+                    )
+                    if not _chat_input_is_empty(ocr, chat_image):
                         self._finish("Clear the ProTanki chat input, then start monitoring again.")
                         return
                     _send_showbattle(current_window, self.battle_id)
@@ -175,10 +277,10 @@ class BattleJoinWatcher:
                 continue
 
             target_confirmed = True
-            if pending_join and (not state.selected or not state.join_buttons_visible):
-                self._finish("ProTanki accepted the join. Check the game screen.")
-                return
-
+            if not pending_join:
+                # While idling, the cropped seat scan is sufficient. Schedule a
+                # full-screen confirmation only shortly after an actual click.
+                next_full_check = float("inf")
             free = state.red_free + state.blue_free
             if free == 0:
                 self._say("Battle found; waiting for an empty player slot\u2026")
@@ -200,8 +302,11 @@ class BattleJoinWatcher:
             _click_ratio(current_window, button_x, 0.96)
             last_attempt = now
             pending_join = True
+            next_full_check = now + RETRY_SECONDS
             self._say("A free slot appeared. Trying to join\u2026")
-            self._stop.wait(RETRY_SECONDS)
+            # Recheck promptly; if the click did not work, RETRY_SECONDS still
+            # prevents repeated clicks while the game processes the request.
+            self._stop.wait(POLL_SECONDS)
 
         self.on_finished("Automatic joining stopped.")
 
@@ -250,16 +355,19 @@ def _find_game_window(process_names: list[str]) -> GameWindow | None:
     return max(candidates, key=lambda candidate: candidate.width * candidate.height, default=None)
 
 
-def _read_battle_screen(ocr, image, target_id: str) -> BattleScreen:
-    width, height = image.size
-    # The AIR client places battle information and team seats in the right panel.
-    left = int(width * 0.665)
-    right = int(width * 0.998)
-    top = int(height * 0.405)
-    # Include the bottom row of the battle panel where the team Join buttons sit.
-    bottom = int(height * 0.999)
-    panel = image.crop((left, top, right, bottom))
-    result = ocr(panel)
+def _read_battle_screen(
+    ocr,
+    image,
+    target_id: str,
+    *,
+    screen_width: int | None = None,
+    screen_height: int | None = None,
+    panel_offset: tuple[int, int] = (0, 0),
+) -> BattleScreen:
+    width = screen_width or image.width
+    height = screen_height or image.height
+    left, top = panel_offset
+    result = ocr(image)
     texts = result.txts or []
     boxes = result.boxes
     selected = False
@@ -293,10 +401,41 @@ def _read_battle_screen(ocr, image, target_id: str) -> BattleScreen:
     return BattleScreen(selected, red_free, blue_free, join_visible)
 
 
-def _chat_input_is_empty(ocr, image) -> bool:
-    width, height = image.size
-    chat = image.crop((int(width * 0.005), int(height * 0.945), int(width * 0.27), int(height * 0.99)))
-    result = ocr(chat)
+def _read_free_seats(
+    ocr,
+    image,
+    *,
+    screen_width: int,
+    screen_height: int,
+    panel_offset: tuple[int, int],
+) -> tuple[int, int]:
+    """Recognize only the roster area during rapid seat monitoring."""
+    result = ocr(image)
+    red_free = 0
+    blue_free = 0
+    left, top = panel_offset
+    for index, text in enumerate(result.txts or []):
+        plain = "".join(character for character in str(text).casefold() if character.isalnum())
+        if not any(marker in plain for marker in ("пусто", "пустo", "пуст0")):
+            continue
+        boxes = result.boxes
+        if boxes is None or index >= len(boxes):
+            continue
+        box = boxes[index]
+        center_x = sum(float(point[0]) for point in box) / 4 + left
+        center_y = sum(float(point[1]) for point in box) / 4 + top
+        relative_y = center_y / screen_height if screen_height else 0
+        if not 0.47 <= relative_y <= 0.88:
+            continue
+        if center_x < screen_width * 0.832:
+            red_free += 1
+        else:
+            blue_free += 1
+    return red_free, blue_free
+
+
+def _chat_input_is_empty(ocr, chat_image) -> bool:
+    result = ocr(chat_image)
     return not any(str(text).strip() for text in (result.txts or []))
 
 
