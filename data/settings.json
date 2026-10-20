@@ -1,11 +1,11 @@
 {
   "last_mode": "CP",
-  "last_server": "CP — пример",
+  "last_server": "cp1",
   "last_servers": {
     "DM": "",
     "TDM": "",
     "CTF": "",
-    "CP": "CP — пример"
+    "CP": "cp1"
   },
   "process_names": [
     "ProTanki.exe",

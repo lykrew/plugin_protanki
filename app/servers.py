@@ -1,7 +1,6 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
-from copy import deepcopy
 from typing import Any
 
 from app.paths import MODES, SERVERS_PATH, SETTINGS_PATH
@@ -31,14 +30,33 @@ def load_catalog() -> dict[str, list[dict[str, str]]]:
             name = str(item.get("name", "")).strip()
             if not name:
                 continue
-            cleaned.append({"name": name, "note": str(item.get("note", "")).strip()})
+            link = str(item.get("battle_link", "")).strip()
+            if not link and name.startswith("#/battle/"):
+                link = name
+            cleaned.append(
+                {
+                    "name": name,
+                    "note": str(item.get("note", "")).strip(),
+                    "battle_link": link,
+                }
+            )
         catalog[mode] = cleaned
     return catalog
 
 
 def save_catalog(catalog: dict[str, list[dict[str, str]]]) -> None:
     SERVERS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    payload = {mode: deepcopy(catalog.get(mode, [])) for mode in MODES}
+    payload = {
+        mode: [
+            {
+                "name": str(item.get("name", "")).strip(),
+                "note": str(item.get("note", "")).strip(),
+                "battle_link": str(item.get("battle_link", "")).strip(),
+            }
+            for item in catalog.get(mode, [])
+        ]
+        for mode in MODES
+    }
     SERVERS_PATH.write_text(
         json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
@@ -90,7 +108,13 @@ def save_settings(settings: dict[str, Any]) -> None:
     )
 
 
-def add_server(catalog: dict[str, list[dict[str, str]]], mode: str, name: str, note: str) -> None:
+def add_server(
+    catalog: dict[str, list[dict[str, str]]],
+    mode: str,
+    name: str,
+    note: str,
+    battle_link: str = "",
+) -> None:
     name = name.strip()
     if mode not in MODES or not name:
         return
@@ -98,8 +122,11 @@ def add_server(catalog: dict[str, list[dict[str, str]]], mode: str, name: str, n
     for item in catalog[mode]:
         if item["name"].casefold() == name.casefold():
             item["note"] = note.strip()
+            item["battle_link"] = battle_link.strip()
             return
-    catalog[mode].append({"name": name, "note": note.strip()})
+    catalog[mode].append(
+        {"name": name, "note": note.strip(), "battle_link": battle_link.strip()}
+    )
 
 
 def remove_server(catalog: dict[str, list[dict[str, str]]], mode: str, name: str) -> None:
