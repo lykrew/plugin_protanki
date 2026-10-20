@@ -13,8 +13,8 @@ import psutil
 
 POLL_SECONDS = 0.12
 RETRY_SECONDS = 0.12
-MULTI_TARGET_DWELL_SECONDS = 0.12
-ROW_SELECT_SETTLE_SECONDS = 0.18
+MULTI_TARGET_DWELL_SECONDS = 0.2
+ROW_SELECT_SETTLE_SECONDS = 0.08
 
 _ocr_lock = threading.Lock()
 _ocr_engine = None
@@ -221,26 +221,74 @@ class BattleJoinWatcher:
                 self._stop.wait(POLL_SECONDS)
                 continue
 
+            # Give the details panel a brief moment to react to the click, then
+            # inspect only the small battle-link field while searching rows.
+            if not target_confirmed and last_clicked_row_y is not None:
+                settle_left = ROW_SELECT_SETTLE_SECONDS - (time.monotonic() - last_row_click_at)
+                if settle_left > 0:
+                    self._stop.wait(min(settle_left, POLL_SECONDS))
+                    continue
+
             try:
                 screen_width = current_window.width
                 screen_height = current_window.height
-                # Include the left edge of the battle-link field in the info
-                # panel so the selected battle ID is visible to OCR.
                 panel_left = int(screen_width * 0.615)
                 panel_top = int(screen_height * 0.405)
                 panel_right = int(screen_width * 0.998)
                 panel_bottom = int(screen_height * 0.999)
-                image = ImageGrab.grab(
-                    bbox=(
-                        current_window.left + panel_left,
-                        current_window.top + panel_top,
-                        current_window.left + panel_right,
-                        current_window.top + panel_bottom,
-                    ),
-                    all_screens=True,
-                )
                 full_check = not target_confirmed or time.monotonic() >= next_full_check
-                if full_check:
+                if not target_confirmed:
+                    # The battle ID is shown in a small field above the roster.
+                    # OCR this crop instead of the whole right-hand panel for
+                    # every candidate row in the visible list.
+                    link_left = int(screen_width * 0.66)
+                    link_top = int(screen_height * 0.425)
+                    link_right = int(screen_width * 0.94)
+                    link_bottom = int(screen_height * 0.49)
+                    link_image = ImageGrab.grab(
+                        bbox=(
+                            current_window.left + link_left,
+                            current_window.top + link_top,
+                            current_window.left + link_right,
+                            current_window.top + link_bottom,
+                        ),
+                        all_screens=True,
+                    )
+                    selected = _read_selected_battle(ocr, link_image, self.battle_id)
+                    if selected:
+                        image = ImageGrab.grab(
+                            bbox=(
+                                current_window.left + panel_left,
+                                current_window.top + panel_top,
+                                current_window.left + panel_right,
+                                current_window.top + panel_bottom,
+                            ),
+                            all_screens=True,
+                        )
+                        state = _read_battle_screen(
+                            ocr,
+                            image,
+                            self.battle_id,
+                            screen_width=screen_width,
+                            screen_height=screen_height,
+                            panel_offset=(panel_left, panel_top),
+                        )
+                        next_full_check = time.monotonic() + 1.5
+                        full_check = True
+                    else:
+                        state = BattleScreen(False, 0, 0, False)
+                        image = None
+                else:
+                    image = ImageGrab.grab(
+                        bbox=(
+                            current_window.left + panel_left,
+                            current_window.top + panel_top,
+                            current_window.left + panel_right,
+                            current_window.top + panel_bottom,
+                        ),
+                        all_screens=True,
+                    )
+                if target_confirmed and full_check:
                     state = _read_battle_screen(
                         ocr,
                         image,
@@ -251,7 +299,7 @@ class BattleJoinWatcher:
                     )
                     next_full_check = time.monotonic() + 1.5
                     full_check = True
-                else:
+                elif target_confirmed:
                     seats_top = max(0, int(screen_height * 0.47) - panel_top)
                     seats_bottom = min(image.height, int(screen_height * 0.88) - panel_top)
                     seats_image = image.crop((0, seats_top, image.width, seats_bottom))
@@ -263,7 +311,7 @@ class BattleJoinWatcher:
                         panel_offset=(panel_left, panel_top + seats_top),
                     )
                     state = BattleScreen(True, red_free, blue_free, True)
-                if pending_join and state.red_free + state.blue_free == 0:
+                if pending_join and state.red_free + state.blue_free == 0 and image is not None:
                     # Only pay for a full-screen OCR pass after the attempted slot
                     # disappears; when it is still free, retry from the fast scan.
                     state = _read_battle_screen(
@@ -307,7 +355,7 @@ class BattleJoinWatcher:
                         last_row_click_at = now
                         cached_row_attempts = 1
                         self._say(f"Rechecking battle {target_index + 1}/{len(self.battle_ids)}...")
-                    elif now - last_row_click_at >= 0.45:
+                    elif now - last_row_click_at >= ROW_SELECT_SETTLE_SECONDS:
                         if cached_row_attempts >= 2:
                             target_rows.pop(self.battle_id, None)
                             list_row_centers = None
@@ -349,7 +397,9 @@ class BattleJoinWatcher:
                 target_rows.setdefault(self.battle_id, last_clicked_row_y)
             cached_row_attempts = 0
             if not target_confirmed:
-                target_confirmed_at = time.monotonic()
+                # Include the selection transition in the rotation interval,
+                # so OCR time does not get added as another delay.
+                target_confirmed_at = last_row_click_at or time.monotonic()
             target_confirmed = True
             if not pending_join:
                 # While idling, the cropped seat scan is sufficient. Schedule a
@@ -436,6 +486,16 @@ def _find_game_window(process_names: list[str]) -> GameWindow | None:
 
     user32.EnumWindows(enum_proc(visit), 0)
     return max(candidates, key=lambda candidate: candidate.width * candidate.height, default=None)
+
+
+def _read_selected_battle(ocr, image, target_id: str) -> bool:
+    """Check the compact battle-link field while scanning candidate rows."""
+    result = ocr(image)
+    normalized = "".join(
+        re.sub(r"[^0-9a-f]", "", str(text).casefold())
+        for text in (result.txts or [])
+    )
+    return target_id in normalized
 
 
 def _read_battle_screen(

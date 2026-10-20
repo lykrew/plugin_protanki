@@ -32,8 +32,17 @@ class CompanionApp(ctk.CTk):
         super().__init__()
         self.title("ProTanki · Companion")
         self.geometry("1140x850")
-        self.minsize(960, 740)
-        self.state("zoomed")
+        self.minsize(820, 640)
+        self.resizable(True, True)
+        screen_width = self.winfo_screenwidth()
+        screen_height = self.winfo_screenheight()
+        self.geometry(f"1140x850+{max(0, (screen_width - 1140) // 2)}+{max(0, (screen_height - 850) // 2)}")
+        self._fade_step = 0
+        self._fade_enabled = True
+        try:
+            self.attributes("-alpha", 0.0)
+        except Exception:
+            self._fade_enabled = False
         self.configure(fg_color=BG)
         self._backdrop = Canvas(self, highlightthickness=0, bd=0, bg=BG)
         self._backdrop.place(x=0, y=0, relwidth=1, relheight=1)
@@ -68,6 +77,23 @@ class CompanionApp(ctk.CTk):
         self._restore_selection()
         self._poll_game()
         self.protocol("WM_DELETE_WINDOW", self._close)
+        self.after_idle(self._fade_in)
+
+    def _fade_in(self) -> None:
+        if not self._fade_enabled:
+            return
+        self._fade_step = min(8, self._fade_step + 1)
+        try:
+            self.attributes("-alpha", self._fade_step / 8)
+        except Exception:
+            self._fade_enabled = False
+            try:
+                self.attributes("-alpha", 1.0)
+            except Exception:
+                pass
+            return
+        if self._fade_step < 8:
+            self.after(18, self._fade_in)
 
     @staticmethod
     def _blend(first: str, second: str, amount: float) -> str:
